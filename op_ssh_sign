@@ -1,0 +1,102 @@
+#!/bin/bash
+
+# The name of the 1password item containing the SSH CA key
+: ${OP_SSH_CA_NAME:=ssh ca}
+
+# The name of the 1password item's field which contains the SSH CA key
+: ${OP_SSH_CA_FIELD:=password}
+
+# Whether the CA key is base64-encoded
+# (Depending on the field used, base64 encoding first makes it possible to include line breaks)
+: ${OP_SSH_CA_FIELD_BASE64:=true}
+
+# Validity time for the ephemeral key
+: ${OP_SSH_KEY_LIFETIME:=24h}
+
+# key_id to be used for certificate
+: ${OP_SSH_KEY_ID:=$(whoami)@$(hostname)}
+
+# ~~~ end of configuration ~~~
+
+set -e
+
+if ! op --help >/dev/null 2>&1; then
+    >&2 echo "Please install the 1password cli before use."
+    exit 1
+fi
+
+if ! jq --help >/dev/null 2>&1; then
+    >&2 echo "Please install jq before use."
+    exit 1
+fi
+
+if ! op get account >/dev/null; then
+    eval $(op signin)
+fi
+
+# ~~ jq helper functions ~~
+
+jq() {
+    json="$1"
+    shift
+    echo "$json" | "$(which jq)" -r --compact-output "$@"
+}
+
+jq_each() {
+    jq "$1" ".[]"
+}
+
+# ~~ main ~~
+
+tmp_dir="$(mktemp -d)"
+trap "rm -rf "$tmp_dir"" EXIT
+
+# retrieve the CA key from 1password
+
+op_item=$(op get item "${OP_SSH_CA_NAME}")
+
+ca_key=null
+# Check top level first
+ca_key="$(jq "${op_item}" -r ".details.\"${OP_SSH_CA_FIELD}\"")"
+# Try each section
+sections=$(jq "$op_item" ".details.sections")
+while read section; do
+    fields="$(jq "$section" ".fields")"
+    while read field; do
+        if [[ "$(jq "$field" .t)" == "$OP_SSH_CA_FIELD" ]]; then
+            ca_key="$(jq "$field" .v)"
+            break
+        fi
+    done < <(jq_each "$fields" 2>/dev/null)
+    if [[ "$ca_key" != "null" ]]; then
+        break
+    fi    
+done < <(jq_each "$sections")
+
+if [[ "$ca_key" == "null" ]]; then
+    >&2 echo "No key found in 1password at $OP_SSH_CA_NAME / $OP_SSH_CA_FIELD"
+    exit 1
+fi    
+
+if [[ "$OP_SSH_CA_FIELD_BASE64" == "true" ]]; then
+    ca_key="$(printf "$ca_key" | base64 --decode)"
+fi
+
+ca_key_file="$tmp_dir/ca_key"
+echo "$ca_key" > "$ca_key_file"
+chmod 600 "$ca_key_file"
+
+# generate key
+
+key_file="${tmp_dir}/user_key"
+ssh-keygen -t ed25519 -f "${key_file}" -N '' >/dev/null
+
+# sign key
+
+ssh-keygen -s "$ca_key_file" -I "$OP_SSH_KEY_ID" -V "+$OP_SSH_KEY_LIFETIME" -z "$(date +%s)" "${key_file}.pub" 2>/dev/null
+
+# load
+
+ssh-add -t "$OP_SSH_KEY_LIFETIME" "$key_file"
+
+# temp files will be deleted by the trap
